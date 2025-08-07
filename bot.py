@@ -15,7 +15,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 import logging
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения из .env файла
@@ -60,6 +60,10 @@ supabase: Client = create_client(
 
 # База знаний amoCRM
 AMOCRM_SUPPORT_URL = "https://www.amocrm.ru/support"
+
+# Константы
+MAX_HISTORY_LENGTH = 10  # Максимальное количество сообщений в истории
+MAX_CONTEXT_MESSAGES = 6  # Максимальное количество сообщений для контекста модели
 
 # Состояния для FSM
 class SupportStates(StatesGroup):
@@ -300,7 +304,7 @@ def save_user_feedback(user_id: int, question: str, helped: bool):
         logging.error(f"Ошибка при сохранении обратной связи: {e}")
 
 # Функция для генерации ответа с помощью OpenRouter (исправленная)
-async def generate_answer(question: str, context: str = "") -> str:
+async def generate_answer(question: str, context: str = "", history: List[Dict[str, str]] = None) -> str:
     """Генерация ответа с помощью OpenRouter"""
     models_to_try = [
         "openrouter/horizon-beta",      # Основная модель
@@ -322,12 +326,20 @@ async def generate_answer(question: str, context: str = "") -> str:
                     Если в контексте есть точный ответ из официальной базы знаний — используй его.
                     Всегда указывай прямую ссылку на источник, если она есть в контексте.
                     Отвечай на русском языке.
-                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
+                    Структурируй ответ с использованием эмодзи для лучшего восприятия.
+                    Учитывай историю диалога с пользователем для более точного ответа."""
                 }
             ]
             
             if context:
                 messages.append({"role": "system", "content": f"Информация из базы знаний amoCRM:\n{context}"})
+            
+            # Добавляем историю диалога (последние MAX_CONTEXT_MESSAGES сообщений)
+            if history:
+                # Берем последние MAX_CONTEXT_MESSAGES сообщений
+                recent_history = history[-MAX_CONTEXT_MESSAGES:] if len(history) > MAX_CONTEXT_MESSAGES else history
+                for msg in recent_history:
+                    messages.append(msg)
             
             messages.append({"role": "user", "content": question})
             
@@ -363,9 +375,24 @@ async def search_web(query: str) -> str:
         logging.error(f"Ошибка при поиске в интернете: {e}")
         return ""
 
+# Функция для очистки истории и состояния
+async def clear_conversation_state(state: FSMContext, chat_id: int):
+    """Очистка состояния диалога и отмену напоминания"""
+    try:
+        # Удаляем запланированное напоминание
+        scheduler.remove_job(f"reminder_{chat_id}")
+    except:
+        pass
+    
+    # Очищаем состояние
+    await state.clear()
+
 # Обработчик команды /start
 @dp.message(Command("start"))
-async def start_command(message: types.Message):
+async def start_command(message: types.Message, state: FSMContext):
+    # Очищаем предыдущее состояние
+    await clear_conversation_state(state, message.chat.id)
+    
     await message.answer(
         "👋 Привет! Я бот технической поддержки по amoCRM для менеджеров продаж недвижимости.\n\n"
         "📚 Я использую официальную базу знаний amoCRM: https://www.amocrm.ru/support\n\n"
@@ -415,8 +442,12 @@ async def history_command(message: types.Message):
 
 # Обработчик команды /clear
 @dp.message(Command("clear"))
-async def clear_command(message: types.Message):
+async def clear_command(message: types.Message, state: FSMContext):
     try:
+        # Очищаем состояние диалога
+        await clear_conversation_state(state, message.chat.id)
+        
+        # Очищаем статистику
         supabase.table("user_feedback").delete().eq("user_id", message.from_user.id).execute()
         await message.answer("🗑️ Ваша история очищена")
     except Exception as e:
@@ -430,6 +461,19 @@ async def handle_message(message: types.Message, state: FSMContext):
     chat_id = message.chat.id
     user_id = message.from_user.id
     
+    # Получаем текущие данные состояния
+    data = await state.get_data()
+    history = data.get("history", [])
+    
+    # Добавляем текущий вопрос в историю
+    history.append({"role": "user", "content": question})
+    
+    # Проверяем, не превышен ли лимит истории
+    if len(history) > MAX_HISTORY_LENGTH:
+        # Если превышен, оставляем только последние MAX_HISTORY_LENGTH сообщений
+        history = history[-MAX_HISTORY_LENGTH:]
+        await message.answer("🔄 История диалога стала слишком длинной, я удалил самые старые сообщения для оптимизации.")
+    
     # Отправляем сообщение о начале поиска
     processing_msg = await message.answer("🔍 Ищу ответ в официальной базе знаний amoCRM...")
     
@@ -438,7 +482,7 @@ async def handle_message(message: types.Message, state: FSMContext):
     
     if amocrm_context:
         await processing_msg.edit_text("📚 Найдено в базе знаний amoCRM. Генерирую ответ...")
-        answer = await generate_answer(question, amocrm_context)
+        answer = await generate_answer(question, amocrm_context, history)
         source = "официальной базы знаний amoCRM"
     else:
         # 2. Если не нашли в базе знаний, ищем в своей базе знаний
@@ -447,16 +491,19 @@ async def handle_message(message: types.Message, state: FSMContext):
         
         if kb_context:
             await processing_msg.edit_text("💡 Найдено в базе знаний. Генерирую ответ...")
-            answer = await generate_answer(question, kb_context)
+            answer = await generate_answer(question, kb_context, history)
             source = "накопленной базы знаний"
         else:
             # 3. Если нигде не нашли, ищем в интернете
             await processing_msg.edit_text("🌐 Ищу дополнительную информацию в интернете...")
             web_context = await search_web(f"{question} amoCRM помощь")
-            answer = await generate_answer(question, web_context)
+            answer = await generate_answer(question, web_context, history)
             source = "интернета"
     
     await processing_msg.delete()
+    
+    # Добавляем ответ в историю
+    history.append({"role": "assistant", "content": answer})
     
     # Отправляем ответ с указанием источника
     await message.answer(f"{escape_html(answer)}\n\n📖 <b>Источник:</b> {escape_html(source)}", parse_mode="HTML")
@@ -469,7 +516,8 @@ async def handle_message(message: types.Message, state: FSMContext):
         answer=answer,
         source=source,
         attempts=0,
-        user_id=user_id
+        user_id=user_id,
+        history=history
     )
     
     # Планируем напоминание через час
@@ -492,12 +540,6 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
     user_id = data.get("user_id", callback.from_user.id)
     chat_id = callback.message.chat.id
     
-    # Удаляем запланированное напоминание
-    try:
-        scheduler.remove_job(f"reminder_{chat_id}")
-    except:
-        pass
-    
     if callback.data == "feedback_yes":
         # Сохранение успешного ответа в базу знаний (только если не из официальной документации)
         if source != "официальной базы знаний amoCRM":
@@ -510,7 +552,9 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
             "✅ Отлично! Я рад, что смог помочь.\n"
             "Если у вас появятся еще вопросы по amoCRM — обращайтесь! 😊"
         )
-        await state.clear()
+        
+        # Очищаем состояние и историю
+        await clear_conversation_state(state, chat_id)
         
     elif callback.data == "feedback_no":
         if attempts < 2:  # Максимум 2 дополнительные попытки
@@ -531,15 +575,26 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
                 "• 📞 Обратиться в официальную поддержку amoCRM\n"
                 "• 💬 Проверить раздел помощи в вашем аккаунте amoCRM"
             )
-            await state.clear()
+            
+            # Очищаем состояние и историю
+            await clear_conversation_state(state, chat_id)
     
     elif callback.data == "search_more":
         # Показываем сообщение о поиске
         await callback.message.edit_text("🔍 Ищу дополнительную информацию в интернете...")
         
+        # Получаем текущую историю
+        history = data.get("history", [])
+        
         # Ищем в интернете с расширенным запросом
         web_context = await search_web(f"{question} amoCRM решение проблемы инструкция")
-        new_answer = await generate_answer(question, web_context)
+        new_answer = await generate_answer(question, web_context, history)
+        
+        # Добавляем новый ответ в историю
+        history.append({"role": "assistant", "content": new_answer})
+        
+        # Обновляем историю в состоянии
+        await state.update_data(history=history)
         
         # Отправляем новый ответ
         await callback.message.edit_text(
@@ -578,17 +633,26 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
             "• Чат в аккаунте amoCRM\n\n"
             "🔗 Также можете написать в базу знаний: https://www.amocrm.ru/support"
         )
-        await state.clear()
+        
+        # Очищаем состояние и историю
+        await clear_conversation_state(state, callback.message.chat.id)
         
     elif callback.data == "try_again":
         data = await state.get_data()
         question = data["question"]
+        history = data.get("history", [])
         
         await callback.message.edit_text("🔄 Пробую найти другой ответ...")
         
         # Ищем в интернете с другим запросом
         web_context = await search_web(f"{question} amoCRM решение проблемы")
-        new_answer = await generate_answer(question, web_context)
+        new_answer = await generate_answer(question, web_context, history)
+        
+        # Добавляем новый ответ в историю
+        history.append({"role": "assistant", "content": new_answer})
+        
+        # Обновляем историю в состоянии
+        await state.update_data(history=history)
         
         await callback.message.edit_text(
             f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
@@ -603,6 +667,16 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
 # Обработчик уточненного вопроса
 @dp.message(SupportStates.waiting_for_clarification)
 async def handle_clarification(message: types.Message, state: FSMContext):
+    # Получаем текущие данные состояния
+    data = await state.get_data()
+    history = data.get("history", [])
+    
+    # Добавляем уточняющий вопрос в историю
+    history.append({"role": "user", "content": message.text})
+    
+    # Обновляем состояние с историей
+    await state.update_data(history=history)
+    
     # Обрабатываем уточненный вопрос как новый
     await state.clear()
     await handle_message(message, state)
