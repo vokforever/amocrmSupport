@@ -1,5 +1,6 @@
 import os
 import asyncio
+import requests
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -80,15 +81,21 @@ def get_clarification_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-# Функция для получения эмбеддинга
+# Функция для получения эмбеддинга с помощью Mistral AI
 def get_embedding(text: str) -> List[float]:
-    """Получение эмбеддинга текста с помощью OpenAI"""
+    """Получение эмбеддинга текста с помощью Mistral AI"""
     try:
-        response = openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text
-        )
-        return response.data[0].embedding
+        headers = {
+            "Authorization": f"Bearer {os.getenv('MISTRAL_API_KEY')}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "mistral-embed",
+            "input": text
+        }
+        response = requests.post("https://api.mistral.ai/v1/embeddings", headers=headers, json=data)
+        response.raise_for_status()
+        return response.json()["data"][0]["embedding"]
     except Exception as e:
         logging.error(f"Ошибка при получении эмбеддинга: {e}")
         return []
@@ -273,18 +280,18 @@ def save_to_knowledge_base(question: str, answer: str, source: str = ""):
     except Exception as e:
         logging.error(f"Ошибка при сохранении в базу знаний: {e}")
 
-# Функция для сохранения статистики
-def save_statistics(user_id: int, question: str, helped: bool):
-    """Сохранение статистики использования"""
+# Функция для сохранения обратной связи пользователя
+def save_user_feedback(user_id: int, question: str, helped: bool):
+    """Сохранение обратной связи пользователя"""
     try:
-        supabase.table("statistics").insert({
+        supabase.table("user_feedback").insert({
             "user_id": user_id,
             "question": question,
             "helped": helped,
             "created_at": datetime.now().isoformat()
         }).execute()
     except Exception as e:
-        logging.error(f"Ошибка при сохранении статистики: {e}")
+        logging.error(f"Ошибка при сохранении обратной связи: {e}")
 
 # Функция для генерации ответа с помощью OpenRouter
 async def generate_answer(question: str, context: str = "", language: str = "ru") -> str:
@@ -345,7 +352,7 @@ async def start_command(message: types.Message):
 @dp.message(Command("stats"))
 async def stats_command(message: types.Message):
     try:
-        response = supabase.table("statistics").select("*").eq("user_id", message.from_user.id).execute()
+        response = supabase.table("user_feedback").select("*").eq("user_id", message.from_user.id).execute()
         total = len(response.data)
         helped = sum(1 for item in response.data if item["helped"])
         
@@ -363,7 +370,7 @@ async def stats_command(message: types.Message):
 @dp.message(Command("history"))
 async def history_command(message: types.Message):
     try:
-        response = supabase.table("statistics").select("*").eq("user_id", message.from_user.id).order("created_at", desc=True).limit(5).execute()
+        response = supabase.table("user_feedback").select("*").eq("user_id", message.from_user.id).order("created_at", desc=True).limit(5).execute()
         
         if response.data:
             history_text = "📝 Последние вопросы:\n\n"
@@ -382,7 +389,7 @@ async def history_command(message: types.Message):
 @dp.message(Command("clear"))
 async def clear_command(message: types.Message):
     try:
-        supabase.table("statistics").delete().eq("user_id", message.from_user.id).execute()
+        supabase.table("user_feedback").delete().eq("user_id", message.from_user.id).execute()
         await message.answer("🗑️ Ваша история очищена")
     except Exception as e:
         logging.error(f"Ошибка при очистке истории: {e}")
@@ -481,8 +488,8 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
         if source != "официальной базы знаний amoCRM":
             save_to_knowledge_base(search_question, answer, source)
         
-        # Сохраняем статистику
-        save_statistics(user_id, question, True)
+        # Сохраняем обратную связь
+        save_user_feedback(user_id, question, True)
         
         await callback.message.edit_text(
             "✅ Отлично! Я рад, что смог помочь.\n"
@@ -499,8 +506,8 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
             # Обновляем состояние
             await state.update_data(attempts=attempts + 1)
         else:
-            # Сохраняем статистику
-            save_statistics(user_id, question, False)
+            # Сохраняем обратную связь
+            save_user_feedback(user_id, question, False)
             
             await callback.message.edit_text(
                 "😔 К сожалению, я не смог найти достаточно информации по вашему вопросу.\n\n"
