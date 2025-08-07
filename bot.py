@@ -17,6 +17,24 @@ import logging
 from langdetect import detect
 import numpy as np
 from typing import List, Tuple
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
+
+# Проверка наличия необходимых переменных окружения
+required_env_vars = [
+    "TELEGRAM_BOT_TOKEN",
+    "OPENROUTER_API_KEY",
+    "TAVILY_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "MISTRAL_API_KEY"
+]
+
+for var in required_env_vars:
+    if not os.getenv(var):
+        raise ValueError(f"Переменная окружения {var} не найдена. Пожалуйста, проверьте файл .env")
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +44,7 @@ bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# OpenRouter (Horizon Beta)
+# OpenRouter (с правильным именем модели)
 openai_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -163,12 +181,19 @@ def detect_language(text: str) -> str:
 async def translate_text(text: str, target_lang: str = "ru") -> str:
     """Перевод текста с помощью OpenAI"""
     try:
+        # Добавляем заголовки для OpenRouter
+        extra_headers = {
+            "HTTP-Referer": "https://github.com/vokforever/amocrm-support",  # Замените на ваш URL
+            "X-Title": "amoCRM Support Bot"  # Замените на название вашего бота
+        }
+        
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="openai/gpt-oss-20b:free",  # Используем бесплатную модель
             messages=[
                 {"role": "system", "content": f"Переведи следующий текст на {target_lang} язык. Сохраняй смысл и технические термины."},
                 {"role": "user", "content": text}
-            ]
+            ],
+            extra_headers=extra_headers
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -293,36 +318,59 @@ def save_user_feedback(user_id: int, question: str, helped: bool):
     except Exception as e:
         logging.error(f"Ошибка при сохранении обратной связи: {e}")
 
-# Функция для генерации ответа с помощью OpenRouter
+# Функция для генерации ответа с помощью OpenRouter (исправленная)
 async def generate_answer(question: str, context: str = "", language: str = "ru") -> str:
     """Генерация ответа с помощью OpenRouter"""
-    try:
-        messages = [
-            {
-                "role": "system",
-                "content": f"""Ты — эксперт технической поддержки по amoCRM (Kommo). 
-                Твоя задача — помогать менеджерам продаж недвижимости решать проблемы с amoCRM.
-                Отвечай максимально релевантно, используя предоставленный контекст.
-                Если в контексте есть точный ответ из официальной базы знаний — используй его.
-                Всегда указывай прямую ссылку на источник, если она есть в контексте.
-                Отвечай на {language} языке.
-                Структурируй ответ с использованием эмодзи для лучшего восприятия."""
+    models_to_try = [
+        "openrouter/horizon-beta",      # Основная модель
+        "openai/gpt-oss-20b:free",     # Запасной вариант 1 (бесплатная модель)
+        "mistralai/mistral-large-2407", # Запасной вариант 2
+        "mistralai/mistral-7b-instruct" # Запасной вариант 3
+    ]
+    
+    last_error = None
+    
+    for model in models_to_try:
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"""Ты — эксперт технической поддержки по amoCRM (Kommo). 
+                    Твоя задача — помогать менеджерам продаж недвижимости решать проблемы с amoCRM.
+                    Отвечай максимально релевантно, используя предоставленный контекст.
+                    Если в контексте есть точный ответ из официальной базы знаний — используй его.
+                    Всегда указывай прямую ссылку на источник, если она есть в контексте.
+                    Отвечай на {language} языке.
+                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
+                }
+            ]
+            
+            if context:
+                messages.append({"role": "system", "content": f"Информация из базы знаний amoCRM:\n{context}"})
+            
+            messages.append({"role": "user", "content": question})
+            
+            # Добавляем заголовки для OpenRouter
+            extra_headers = {
+                "HTTP-Referer": "https://github.com/vokforever/amocrm-support",  # Замените на ваш URL
+                "X-Title": "amoCRM Support Bot"  # Замените на название вашего бота
             }
-        ]
-        
-        if context:
-            messages.append({"role": "system", "content": f"Информация из базы знаний amoCRM:\n{context}"})
-        
-        messages.append({"role": "user", "content": question})
-        
-        completion = openai_client.chat.completions.create(
-            model="horizon-beta",
-            messages=messages,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Ошибка при генерации ответа: {e}")
-        return "😔 К сожалению, произошла ошибка при генерации ответа. Попробуйте еще раз."
+            
+            completion = openai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                extra_headers=extra_headers
+            )
+            return completion.choices[0].message.content
+            
+        except Exception as e:
+            last_error = e
+            logging.warning(f"Ошибка при использовании модели {model}: {e}")
+            continue
+    
+    # Если все модели не сработали
+    logging.error(f"Все модели недоступны. Последняя ошибка: {last_error}")
+    return "😔 К сожалению, произошла ошибка при генерации ответа. Все модели временно недоступны. Попробуйте повторить запрос позже."
 
 # Функция для поиска в интернете через Tavily
 async def search_web(query: str) -> str:
