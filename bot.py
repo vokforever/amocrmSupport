@@ -66,6 +66,15 @@ class SupportStates(StatesGroup):
     waiting_for_feedback = State()
     waiting_for_clarification = State()
 
+# Функция для экранирования HTML-символов
+def escape_html(text: str) -> str:
+    """Экранирование HTML-символов в тексте"""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
 # Функция для создания клавиатуры обратной связи
 def get_feedback_keyboard():
     builder = InlineKeyboardBuilder()
@@ -450,7 +459,7 @@ async def handle_message(message: types.Message, state: FSMContext):
     await processing_msg.delete()
     
     # Отправляем ответ с указанием источника
-    await message.answer(f"{answer}\n\n📖 *Источник: {source}*", parse_mode="Markdown")
+    await message.answer(f"{escape_html(answer)}\n\n📖 <b>Источник:</b> {escape_html(source)}", parse_mode="HTML")
     await message.answer("❓ Помог ли вам мой ответ?", reply_markup=get_feedback_keyboard())
     
     # Установка состояния ожидания обратной связи
@@ -534,8 +543,8 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
         
         # Отправляем новый ответ
         await callback.message.edit_text(
-            f"{new_answer}\n\n📖 *Источник: дополнительный поиск в интернете*",
-            parse_mode="Markdown"
+            f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
+            parse_mode="HTML"
         )
         
         # Снова спрашиваем, помог ли ответ
@@ -582,8 +591,8 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
         new_answer = await generate_answer(question, web_context)
         
         await callback.message.edit_text(
-            f"{new_answer}\n\n📖 *Источник: дополнительный поиск в интернете*",
-            parse_mode="Markdown",
+            f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
+            parse_mode="HTML",
             reply_markup=get_feedback_keyboard()
         )
         
