@@ -14,7 +14,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiohttp
 from bs4 import BeautifulSoup
 import logging
-from langdetect import detect
 import numpy as np
 from typing import List, Tuple
 from dotenv import load_dotenv
@@ -78,7 +77,11 @@ def get_feedback_keyboard():
         text="❌ Нет, не помогло",
         callback_data="feedback_no"
     ))
-    builder.adjust(2)
+    builder.add(types.InlineKeyboardButton(
+        text="🔍 Поищи еще",
+        callback_data="search_more"
+    ))
+    builder.adjust(2, 1)  # Первая строка с 2 кнопками, вторая с 1
     return builder.as_markup()
 
 # Функция для создания клавиатуры уточнения
@@ -168,37 +171,6 @@ def save_to_vector_knowledge_base(question: str, answer: str, source: str = ""):
             }).execute()
     except Exception as e:
         logging.error(f"Ошибка при сохранении в векторную базу знаний: {e}")
-
-# Функция для определения языка
-def detect_language(text: str) -> str:
-    """Определение языка текста"""
-    try:
-        return detect(text)
-    except:
-        return "ru"  # По умолчанию русский
-
-# Функция для перевода текста
-async def translate_text(text: str, target_lang: str = "ru") -> str:
-    """Перевод текста с помощью OpenAI"""
-    try:
-        # Добавляем заголовки для OpenRouter
-        extra_headers = {
-            "HTTP-Referer": "https://github.com/vokforever/amocrm-support",  # Замените на ваш URL
-            "X-Title": "amoCRM Support Bot"  # Замените на название вашего бота
-        }
-        
-        response = openai_client.chat.completions.create(
-            model="openai/gpt-oss-20b:free",  # Используем бесплатную модель
-            messages=[
-                {"role": "system", "content": f"Переведи следующий текст на {target_lang} язык. Сохраняй смысл и технические термины."},
-                {"role": "user", "content": text}
-            ],
-            extra_headers=extra_headers
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Ошибка при переводе: {e}")
-        return text
 
 # Функция для прямого поиска в базе знаний amoCRM
 async def search_amocrm_support(query: str) -> str:
@@ -319,7 +291,7 @@ def save_user_feedback(user_id: int, question: str, helped: bool):
         logging.error(f"Ошибка при сохранении обратной связи: {e}")
 
 # Функция для генерации ответа с помощью OpenRouter (исправленная)
-async def generate_answer(question: str, context: str = "", language: str = "ru") -> str:
+async def generate_answer(question: str, context: str = "") -> str:
     """Генерация ответа с помощью OpenRouter"""
     models_to_try = [
         "openrouter/horizon-beta",      # Основная модель
@@ -335,12 +307,12 @@ async def generate_answer(question: str, context: str = "", language: str = "ru"
             messages = [
                 {
                     "role": "system",
-                    "content": f"""Ты — эксперт технической поддержки по amoCRM (Kommo). 
+                    "content": """Ты — эксперт технической поддержки по amoCRM (Kommo). 
                     Твоя задача — помогать менеджерам продаж недвижимости решать проблемы с amoCRM.
                     Отвечай максимально релевантно, используя предоставленный контекст.
                     Если в контексте есть точный ответ из официальной базы знаний — используй его.
                     Всегда указывай прямую ссылку на источник, если она есть в контексте.
-                    Отвечай на {language} языке.
+                    Отвечай на русском языке.
                     Структурируй ответ с использованием эмодзи для лучшего восприятия."""
                 }
             ]
@@ -389,7 +361,6 @@ async def start_command(message: types.Message):
         "👋 Привет! Я бот технической поддержки по amoCRM для менеджеров продаж недвижимости.\n\n"
         "📚 Я использую официальную базу знаний amoCRM: https://www.amocrm.ru/support\n\n"
         "💡 Просто задайте ваш вопрос, и я найду для вас ответ!\n\n"
-        "🌐 Я поддерживаю разные языки - просто пишите на вашем языке!\n\n"
         "📊 Доступные команды:\n"
         "/stats - моя статистика помощи\n"
         "/history - история обращений\n"
@@ -446,44 +417,34 @@ async def clear_command(message: types.Message):
 # Основной обработчик сообщений
 @dp.message(F.text)
 async def handle_message(message: types.Message, state: FSMContext):
-    original_question = message.text
+    question = message.text
     chat_id = message.chat.id
     user_id = message.from_user.id
-    
-    # Определяем язык вопроса
-    detected_lang = detect_language(original_question)
-    
-    # Если вопрос не на русском, переводим его для поиска в базе знаний amoCRM
-    if detected_lang != "ru":
-        await message.answer("🔄 Обнаружен другой язык, переводю вопрос для поиска в базе знаний...")
-        search_question = await translate_text(original_question, "ru")
-    else:
-        search_question = original_question
     
     # Отправляем сообщение о начале поиска
     processing_msg = await message.answer("🔍 Ищу ответ в официальной базе знаний amoCRM...")
     
     # 1. Сначала ищем в официальной базе знаний amoCRM
-    amocrm_context = await search_amocrm_support(search_question)
+    amocrm_context = await search_amocrm_support(question)
     
     if amocrm_context:
         await processing_msg.edit_text("📚 Найдено в базе знаний amoCRM. Генерирую ответ...")
-        answer = await generate_answer(search_question, amocrm_context, detected_lang)
+        answer = await generate_answer(question, amocrm_context)
         source = "официальной базы знаний amoCRM"
     else:
         # 2. Если не нашли в базе знаний, ищем в своей базе знаний
         await processing_msg.edit_text("🗂️ Ищу в накопленной базе знаний...")
-        kb_context = search_knowledge_base(search_question)
+        kb_context = search_knowledge_base(question)
         
         if kb_context:
             await processing_msg.edit_text("💡 Найдено в базе знаний. Генерирую ответ...")
-            answer = await generate_answer(search_question, kb_context, detected_lang)
+            answer = await generate_answer(question, kb_context)
             source = "накопленной базы знаний"
         else:
             # 3. Если нигде не нашли, ищем в интернете
             await processing_msg.edit_text("🌐 Ищу дополнительную информацию в интернете...")
-            web_context = await search_web(f"{search_question} amoCRM помощь")
-            answer = await generate_answer(search_question, web_context, detected_lang)
+            web_context = await search_web(f"{question} amoCRM помощь")
+            answer = await generate_answer(question, web_context)
             source = "интернета"
     
     await processing_msg.delete()
@@ -495,13 +456,11 @@ async def handle_message(message: types.Message, state: FSMContext):
     # Установка состояния ожидания обратной связи
     await state.set_state(SupportStates.waiting_for_feedback)
     await state.update_data(
-        question=original_question,
-        search_question=search_question,
+        question=question,
         answer=answer,
         source=source,
         attempts=0,
-        user_id=user_id,
-        language=detected_lang
+        user_id=user_id
     )
     
     # Планируем напоминание через час
@@ -514,11 +473,10 @@ async def handle_message(message: types.Message, state: FSMContext):
     )
 
 # Обработчик кнопок обратной связи
-@dp.callback_query(F.data.in_(["feedback_yes", "feedback_no"]))
+@dp.callback_query(F.data.in_(["feedback_yes", "feedback_no", "search_more"]))
 async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     question = data["question"]
-    search_question = data.get("search_question", question)
     answer = data["answer"]
     source = data["source"]
     attempts = data.get("attempts", 0)
@@ -534,7 +492,7 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
     if callback.data == "feedback_yes":
         # Сохранение успешного ответа в базу знаний (только если не из официальной документации)
         if source != "официальной базы знаний amoCRM":
-            save_to_knowledge_base(search_question, answer, source)
+            save_to_knowledge_base(question, answer, source)
         
         # Сохраняем обратную связь
         save_user_feedback(user_id, question, True)
@@ -565,6 +523,34 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
                 "• 💬 Проверить раздел помощи в вашем аккаунте amoCRM"
             )
             await state.clear()
+    
+    elif callback.data == "search_more":
+        # Показываем сообщение о поиске
+        await callback.message.edit_text("🔍 Ищу дополнительную информацию в интернете...")
+        
+        # Ищем в интернете с расширенным запросом
+        web_context = await search_web(f"{question} amoCRM решение проблемы инструкция")
+        new_answer = await generate_answer(question, web_context)
+        
+        # Отправляем новый ответ
+        await callback.message.edit_text(
+            f"{new_answer}\n\n📖 *Источник: дополнительный поиск в интернете*",
+            parse_mode="Markdown"
+        )
+        
+        # Снова спрашиваем, помог ли ответ
+        await bot.send_message(
+            chat_id,
+            "❓ Помог ли вам этот новый ответ?",
+            reply_markup=get_feedback_keyboard()
+        )
+        
+        # Обновляем состояние
+        await state.update_data(
+            answer=new_answer,
+            source="интернета (дополнительный поиск)",
+            attempts=attempts + 1
+        )
 
 # Обработчик кнопок уточнения
 @dp.callback_query(F.data.in_(["clarify_question", "contact_support", "try_again"]))
@@ -587,14 +573,13 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
         
     elif callback.data == "try_again":
         data = await state.get_data()
-        search_question = data.get("search_question", data["question"])
-        language = data.get("language", "ru")
+        question = data["question"]
         
         await callback.message.edit_text("🔄 Пробую найти другой ответ...")
         
         # Ищем в интернете с другим запросом
-        web_context = await search_web(f"{search_question} amoCRM решение проблемы")
-        new_answer = await generate_answer(search_question, web_context, language)
+        web_context = await search_web(f"{question} amoCRM решение проблемы")
+        new_answer = await generate_answer(question, web_context)
         
         await callback.message.edit_text(
             f"{new_answer}\n\n📖 *Источник: дополнительный поиск в интернете*",
